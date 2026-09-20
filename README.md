@@ -1,8 +1,89 @@
-# Stellar Alert + Case Syslog Daemon
+<h1 align="center">Stellar Relay</h1>
 
-A long-running Python daemon that pulls **Stellar Cyber alerts and cases** from the Stellar API and forwards them to a remote collector over **TCP as newline-delimited JSON (NDJSON)**.
+<p align="center">
+  <strong>Forward Stellar Cyber alerts and cases as reliable NDJSON streams.</strong>
+</p>
 
-Each stream (alert / case) can be enabled independently. Only streams with full CLI configuration are fetched and sent.
+<p align="center">
+  A lightweight Python daemon that polls Stellar Cyber, queues records locally, and forwards enabled Alert and Case streams to a TCP collector.
+</p>
+
+<p align="center">
+  <strong>English</strong> · <a href="README.ko.md">한국어</a> · <a href="https://stellar-relay.xdr.ooo/">Product Website</a>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.9%2B-2563EB?style=flat-square&logo=python&logoColor=white" alt="Python 3.9+">
+  <img src="https://img.shields.io/badge/output-NDJSON-16A34A?style=flat-square" alt="NDJSON">
+  <img src="https://img.shields.io/badge/transport-TCP-7C3AED?style=flat-square" alt="TCP">
+  <img src="https://img.shields.io/badge/state-SQLite-0F766E?style=flat-square&logo=sqlite&logoColor=white" alt="SQLite">
+</p>
+
+<p align="center">
+  <strong>Product website:</strong> <a href="https://stellar-relay.xdr.ooo/">stellar-relay.xdr.ooo</a>
+</p>
+
+---
+
+## Bridge Stellar Cyber data to the collector you already use
+
+Stellar Relay is a long-running Python daemon for forwarding **Stellar Cyber Alerts and Cases** to a remote collector over TCP as newline-delimited JSON.
+
+Alert and Case streams are independently configurable. The daemon fetches only streams that are fully configured, stores queue/checkpoint state locally, and sends one JSON object per line.
+
+## What it does
+
+| Capability | What Stellar Relay provides |
+|---|---|
+| **Alert forwarding** | Poll Stellar Cyber Alerts on a configured interval and forward them over TCP |
+| **Case forwarding** | Poll Cases independently, including optional summary/Kill Chain fields |
+| **Reliable local state** | SQLite queue and checkpoints under `~/.local/state/stellar_alert_case/` |
+| **NDJSON output** | UTF-8, newline-delimited JSON suitable for downstream collectors/parsers |
+| **Independent streams** | Alert-only, Case-only, or both |
+| **Backfill** | Explicit historical re-fetch mode for controlled testing/recovery workflows |
+| **Service operation** | Long-running daemon model with a documented systemd deployment pattern |
+
+## Data flow
+
+```mermaid
+flowchart LR
+    S["Stellar Cyber API"] --> P["Stellar Relay<br/>Alert / Case Pollers"]
+    P --> Q["SQLite Queue<br/>Checkpoints"]
+    Q --> T["TCP Sender"]
+    T --> C["Remote Collector<br/>NDJSON"]
+```
+
+## Quick start
+
+Clone the repository and run the main daemon:
+
+```bash
+git clone https://github.com/xdr-labs/Stellar-Case-Alert-to-Sylog.git
+cd Stellar-Case-Alert-to-Sylog
+
+python3 Stellar_Alert_Case_Syslog.py \
+  --alert-interval 60 \
+  --alert-syslog-ip 10.10.10.20 \
+  --alert-syslog-port 5201
+```
+
+For Case forwarding:
+
+```bash
+python3 Stellar_Alert_Case_Syslog.py \
+  --case-interval 3600 \
+  --case-syslog-ip 10.10.10.20 \
+  --case-syslog-port 5142 \
+  --case-include-summary \
+  --no-case-format-summary \
+  --case-fetch-timeout 90
+```
+
+At least one stream must be fully configured.
+
+> Despite the historical repository/script naming, the output is **NDJSON over TCP**, not RFC 5424 syslog text.
+
+For the product guide, installation flow, examples, and operational reference, start at **https://stellar-relay.xdr.ooo/**.
 
 ---
 
