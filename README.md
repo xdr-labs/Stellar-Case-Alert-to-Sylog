@@ -67,7 +67,7 @@ python3 Stellar_Alert_Case_Syslog.py --setup
 
 The wizard asks for:
 
-- Stellar host, user ID, and All-Access API token
+- Stellar host, email-format user ID, and All-Access API token
 - whether to enable Alert forwarding
 - whether to enable Case forwarding
 - interval, destination IP, and destination TCP port for each enabled stream
@@ -127,7 +127,7 @@ Alert only:
 ```bash
 python3 Stellar_Alert_Case_Syslog.py \
   --host YOUR_STELLAR_HOST \
-  --userid YOUR_USER_ID \
+  --userid YOUR_USER_EMAIL \
   --alert-interval 60 \
   --alert-syslog-ip 10.10.10.20 \
   --alert-syslog-port 5201
@@ -138,7 +138,7 @@ Case only:
 ```bash
 python3 Stellar_Alert_Case_Syslog.py \
   --host YOUR_STELLAR_HOST \
-  --userid YOUR_USER_ID \
+  --userid YOUR_USER_EMAIL \
   --case-interval 300 \
   --case-syslog-ip 10.10.10.20 \
   --case-syslog-port 5202
@@ -149,7 +149,7 @@ Alert + Case:
 ```bash
 python3 Stellar_Alert_Case_Syslog.py \
   --host YOUR_STELLAR_HOST \
-  --userid YOUR_USER_ID \
+  --userid YOUR_USER_EMAIL \
   --alert-interval 60 \
   --alert-syslog-ip 10.10.10.20 \
   --alert-syslog-port 5201 \
