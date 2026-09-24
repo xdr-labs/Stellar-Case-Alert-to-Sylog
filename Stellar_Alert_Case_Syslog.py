@@ -1484,11 +1484,19 @@ def _alert_fetch_watermark_bootstrap(conn: sqlite3.Connection) -> None:
         pass
 
 
-def _alert_fetch_lower_bound_ms(conn: sqlite3.Connection) -> int:
+def _alert_fetch_lower_bound_ms(
+    conn: sqlite3.Connection,
+    stable_upper_bound_ms: Optional[int] = None,
+) -> int:
     wm = _alert_fetch_watermark_read(conn)
     if wm is not None:
         return wm
-    return now_ms() - initial_lookback_ms()
+    if stable_upper_bound_ms is None:
+        stable_upper_bound_ms = _alert_fetch_stable_upper_bound_ms()
+    # Initial alert lookback is measured from the closed/stable upper bound,
+    # not wall-clock now. This keeps short lookbacks (including 0 = 1 minute)
+    # valid even when the stability lag is longer than the lookback window.
+    return stable_upper_bound_ms - initial_lookback_ms()
 
 
 def _alert_fetch_stable_upper_bound_ms() -> int:
@@ -1686,8 +1694,8 @@ def alert_fetch_and_enqueue(conn: sqlite3.Connection) -> dict:
             page_search_after = window_state.get("search_after")
             fetch_window_resumed = True
         else:
-            lower_bound_ms = _alert_fetch_lower_bound_ms(conn)
             upper_bound_ms = _alert_fetch_stable_upper_bound_ms()
+            lower_bound_ms = _alert_fetch_lower_bound_ms(conn, upper_bound_ms)
         if upper_bound_ms <= lower_bound_ms:
             fetch_skipped = True
             debug_log(
