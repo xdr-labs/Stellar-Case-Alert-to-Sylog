@@ -44,7 +44,7 @@ python3 Stellar_Alert_Case_Syslog.py --setup
 
 Wizard에서는 다음을 설정합니다.
 
-- Stellar Host / User ID / All-Access API Token
+- Stellar Host / 이메일 형식 User ID / All-Access API Token
 - Alert Forwarding 사용 여부
 - Case Forwarding 사용 여부
 - 활성화한 Stream의 Interval / Destination IP / TCP Port
@@ -102,7 +102,7 @@ Alert only:
 ```bash
 python3 Stellar_Alert_Case_Syslog.py \
   --host YOUR_STELLAR_HOST \
-  --userid YOUR_USER_ID \
+  --userid YOUR_USER_EMAIL \
   --alert-interval 60 \
   --alert-syslog-ip 10.10.10.20 \
   --alert-syslog-port 5201
@@ -113,7 +113,7 @@ Case only:
 ```bash
 python3 Stellar_Alert_Case_Syslog.py \
   --host YOUR_STELLAR_HOST \
-  --userid YOUR_USER_ID \
+  --userid YOUR_USER_EMAIL \
   --case-interval 300 \
   --case-syslog-ip 10.10.10.20 \
   --case-syslog-port 5202
