@@ -14,20 +14,26 @@ Stellar Cyber Alert + Case → Syslog daemon.
 import argparse
 import base64
 import fcntl
+import getpass
+import ipaddress
 import json
 import os
+import pwd
 import random
 import re
+import shlex
 import signal
 import socket
 import sqlite3
 import ssl
+import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from urllib.error import HTTPError, URLError
+from urllib.error import HTTPError
 from urllib.parse import urlencode, urlunparse
 from urllib.request import Request, urlopen
 
@@ -37,7 +43,7 @@ from urllib.request import Request, urlopen
 
 HOST = "xdr.ooo"
 USERID = "ruda@rick.kr"
-ALL_ACCESS_TOKEN = "gOVtgdxveQWc5TIcZAFbC4D0WDXtnLQESmov34gCkEWUv23BtuOid6H6iFhV0CoVYIpf4Ou0OJIHHleBER43Uw"
+ALL_ACCESS_TOKEN = os.environ.get("STELLAR_TOKEN", "")
 
 ALERT_INTERVAL_SEC = None
 CASE_INTERVAL_SEC = None
@@ -50,15 +56,14 @@ CASE_SYSLOG_PORT = None
 ALERT_ENABLED = False
 CASE_ENABLED = False
 
-INITIAL_LOOKBACK_HOURS = 0
-INITIAL_LOOKBACK_ZERO_MINUTES = 1  # default first-run lookback when checkpoint is absent
+INITIAL_LOOKBACK_HOURS = 48
+INITIAL_LOOKBACK_ZERO_MINUTES = 1  # when --initial-lookback-hours 0
 BACKFILL_DAYS = None  # set by --backfill (test mode)
 
 CASE_MIN_SCORE = 10
 CASE_INCLUDE_SUMMARY = True
-CASE_FORMAT_SUMMARY = False
+CASE_FORMAT_SUMMARY = True
 CASE_FETCH_LIMIT = 200
-CASE_FETCH_TIMEOUT_SEC = 90
 
 FETCH_SIZE = 200
 MAX_FETCH_PAGES_PER_CYCLE = 10
@@ -101,15 +106,6 @@ class ShutdownRequested(Exception):
 
 class SinkTransmissionError(Exception):
     """Raised when the TCP syslog destination is unreachable or send fails."""
-
-
-class CaseFetchError(RuntimeError):
-    """Raised when the Cases API fetch fails (timeout, HTTP error, JSON decode)."""
-
-    def __init__(self, kind: str, message: str, http_code: Optional[int] = None) -> None:
-        super().__init__(message)
-        self.kind = kind
-        self.http_code = http_code
 
 
 # Hourly send-log handles (alert / case)
@@ -182,9 +178,15 @@ def validate_stream_cli(args) -> Optional[str]:
                 f"(missing: {', '.join(missing)})"
             )
         if all(provided):
-            interval = values[0]
+            interval, syslog_ip, syslog_port = values
             if interval < 1:
                 return f"{labels[name][0]} must be a positive integer (seconds)"
+            try:
+                ipaddress.ip_address(syslog_ip)
+            except ValueError:
+                return f"{labels[name][1]} must be a valid IPv4 or IPv6 address"
+            if not (1 <= syslog_port <= 65535):
+                return f"{labels[name][2]} must be between 1 and 65535"
             enabled += 1
     if enabled == 0:
         return (
@@ -421,15 +423,6 @@ _CASE_KILL_CHAIN_STAGE_DICT_KEYS = (
     "killChainStages",
 )
 
-_CASE_KILL_CHAIN_NESTED_DICT_KEYS = (
-    "kill_chain",
-    "killChain",
-    "xdr_kill_chain",
-    "xdrKillChain",
-    "kill_chain_summary",
-    "killChainSummary",
-)
-
 
 def _case_kill_chain_stages_zero() -> Dict[str, int]:
     return {name: 0 for name in _CASE_KILL_CHAIN_STAGE_FIELDS}
@@ -471,22 +464,12 @@ def _case_kill_chain_apply_stages_value(result: Dict[str, int], stages: Any) -> 
                 _case_kill_chain_apply_label(result, item)
 
 
-def _case_kill_chain_apply_stages_from_dict_container(
-    result: Dict[str, int], container: dict,
-) -> None:
-    for key in _CASE_KILL_CHAIN_STAGE_DICT_KEYS:
-        stages = container.get(key)
-        if stages is not None:
-            _case_kill_chain_apply_stages_value(result, stages)
-
-
 def _parse_case_kill_chain_stages_from_dict(summary: dict) -> Dict[str, int]:
     result = _case_kill_chain_stages_zero()
-    _case_kill_chain_apply_stages_from_dict_container(result, summary)
-    for key in _CASE_KILL_CHAIN_NESTED_DICT_KEYS:
-        nested = summary.get(key)
-        if isinstance(nested, dict):
-            _case_kill_chain_apply_stages_from_dict_container(result, nested)
+    for key in _CASE_KILL_CHAIN_STAGE_DICT_KEYS:
+        stages = summary.get(key)
+        if stages is not None:
+            _case_kill_chain_apply_stages_value(result, stages)
     return result
 
 
@@ -529,68 +512,6 @@ def parse_case_kill_chain_stages(summary: Any) -> Dict[str, int]:
     return _case_kill_chain_stages_zero()
 
 
-def _case_existing_kill_chain_fields(src: dict) -> Dict[str, int]:
-    result = _case_kill_chain_stages_zero()
-    for key in _CASE_KILL_CHAIN_STAGE_FIELDS:
-        try:
-            val = int(src.get(key, 0) or 0)
-            result[key] = 1 if val != 0 else 0
-        except (TypeError, ValueError):
-            result[key] = 0
-    return result
-
-
-def _case_resolve_kill_chain_fields(src: dict) -> Tuple[Dict[str, int], str]:
-    summary = src.get("summary")
-    parsed = parse_case_kill_chain_stages(summary)
-
-    if any(parsed.values()):
-        if isinstance(summary, str):
-            return parsed, "summary_string"
-        if isinstance(summary, dict):
-            return parsed, "summary_dict"
-        return parsed, "summary"
-
-    existing = _case_existing_kill_chain_fields(src)
-    if any(existing.values()):
-        return existing, "existing_payload_fields"
-
-    if summary is None:
-        return parsed, "missing_summary"
-
-    return parsed, "unparsed_summary"
-
-
-def _case_kill_chain_outbound_fields(outbound: dict) -> Dict[str, int]:
-    return {name: outbound.get(name, 0) for name in _CASE_KILL_CHAIN_STAGE_FIELDS}
-
-
-# TEMP(diagnostic): remove after production kill-chain root-cause is closed.
-def _case_summary_diagnostic_fields(payload: dict) -> Dict[str, Any]:
-    """Build summary/kill-chain diagnostic fields for send log and debug output."""
-    if not isinstance(payload, dict):
-        return {
-            "summary_present": False,
-            "summary_type": "NoneType",
-            "summary_first_line": None,
-            "parsed_kill_chain_stages": _case_kill_chain_stages_zero(),
-            "kill_chain_parse_source": "non_dict_payload",
-        }
-    summary = payload.get("summary")
-    parsed, source = _case_resolve_kill_chain_fields(payload)
-    lines = summary.splitlines() if isinstance(summary, str) else []
-    fields: Dict[str, Any] = {
-        "summary_present": summary is not None,
-        "summary_type": type(summary).__name__ if summary is not None else "NoneType",
-        "summary_first_line": lines[0] if lines else None,
-        "parsed_kill_chain_stages": parsed,
-        "kill_chain_parse_source": payload.get("kill_chain_parse_source") or source,
-    }
-    if payload.get("summary_fetch_fallback"):
-        fields["summary_fetch_fallback"] = True
-    return fields
-
-
 def _alert_syslog_payload(src: Any) -> dict:
     """Shallow-copy alert payload and add stellar_record_type for syslog (does not mutate src)."""
     outbound = dict(src) if isinstance(src, dict) else {"raw": src}
@@ -603,11 +524,7 @@ def _case_syslog_payload(src: Any) -> dict:
     outbound = dict(src) if isinstance(src, dict) else {"raw": src}
     outbound["stellar_record_type"] = STELLAR_RECORD_TYPE_CASE
     if isinstance(src, dict):
-        kill_chain_fields, parse_source = _case_resolve_kill_chain_fields(src)
-        outbound.update(kill_chain_fields)
-        outbound["kill_chain_parse_source"] = src.get("kill_chain_parse_source") or parse_source
-        if src.get("summary_fetch_fallback"):
-            outbound["summary_fetch_fallback"] = True
+        outbound.update(parse_case_kill_chain_stages(src.get("summary")))
         for src_key, utc_key in (
             ("created_at", "created_at_utc"),
             ("modified_at", "modified_at_utc"),
@@ -694,8 +611,6 @@ def _case_send_log_fields(obj: dict, meta: Optional[dict] = None) -> dict:
                 fields[key] = 0
         else:
             fields[key] = 0
-    # TEMP(diagnostic): remove after production kill-chain root-cause is closed.
-    fields.update(_case_summary_diagnostic_fields(payload))
     return fields
 
 
@@ -2148,150 +2063,26 @@ def alert_drain_queue(
 # Case fetch / send
 # ============================================================
 
-def _case_fetch_build_url(
-    jwt: str,
-    from_ts: int,
-    skip: int,
-    *,
-    include_summary: bool,
-    format_summary: bool,
-) -> Tuple[str, dict]:
+def fetch_cases_page(jwt: str, from_ts: int, skip: int = 0):
     params = {
         "FROM~modified_at": str(from_ts),
         "min_score": str(CASE_MIN_SCORE),
         "sort": "modified_at",
         "order": "asc",
         "limit": str(CASE_FETCH_LIMIT),
-        "include_summary": "true" if include_summary else "false",
-        "format_summary": "true" if format_summary else "false",
+        "include_summary": "true" if CASE_INCLUDE_SUMMARY else "false",
+        "format_summary": "true" if CASE_FORMAT_SUMMARY else "false",
     }
     if skip > 0:
         params["skip"] = str(skip)
+
     qs = urlencode(params)
     url = f"https://{HOST}/connect/api/v1/cases?{qs}"
     headers = {"Authorization": f"Bearer {jwt}", "Accept": "application/json"}
-    return url, headers
-
-
-def _case_fetch_http(url: str, headers: dict) -> bytes:
-    """GET Cases API page; raise CaseFetchError with a distinct kind on failure."""
-    try:
-        code, body = http_get(url, headers, timeout=CASE_FETCH_TIMEOUT_SEC)
-    except TimeoutError as e:
-        raise CaseFetchError(
-            "timeout",
-            f"Case fetch timeout after {CASE_FETCH_TIMEOUT_SEC}s",
-        ) from e
-    except URLError as e:
-        reason = e.reason
-        if isinstance(reason, (TimeoutError, socket.timeout)):
-            raise CaseFetchError(
-                "timeout",
-                f"Case fetch timeout after {CASE_FETCH_TIMEOUT_SEC}s",
-            ) from e
-        if isinstance(reason, ConnectionResetError):
-            raise CaseFetchError("connection", f"Case fetch connection reset: {e}") from e
-        raise CaseFetchError("connection", f"Case fetch connection error: {e}") from e
-    except OSError as e:
-        raise CaseFetchError("connection", f"Case fetch connection error: {e}") from e
-
+    code, body = http_get(url, headers, timeout=30)
     if code != 200:
-        snippet = body[:200] if body else b""
-        raise CaseFetchError(
-            "http_error",
-            f"Case fetch failed HTTP {code}: {snippet!r}",
-            http_code=code,
-        )
-    return body
-
-
-def _case_fetch_log_error(kind: str, message: str, http_code: Optional[int] = None) -> None:
-    event = {
-        "timeout": "case_fetch_timeout",
-        "http_error": "case_fetch_http_error",
-        "json_error": "case_fetch_json_error",
-        "connection": "case_fetch_connection_error",
-    }.get(kind, "case_fetch_error")
-    log_operational_event(
-        "case", "stellar_api", event, message,
-        error=message, http_code=http_code,
-        include_summary=CASE_INCLUDE_SUMMARY,
-        format_summary=CASE_FORMAT_SUMMARY,
-        fetch_timeout_sec=CASE_FETCH_TIMEOUT_SEC,
-    )
-
-
-def fetch_cases_page(
-    jwt: str,
-    from_ts: int,
-    skip: int = 0,
-    *,
-    include_summary: Optional[bool] = None,
-    format_summary: Optional[bool] = None,
-) -> dict:
-    inc = CASE_INCLUDE_SUMMARY if include_summary is None else include_summary
-    fmt = CASE_FORMAT_SUMMARY if format_summary is None else format_summary
-    url, headers = _case_fetch_build_url(
-        jwt, from_ts, skip, include_summary=inc, format_summary=fmt,
-    )
-    body = _case_fetch_http(url, headers)
-    try:
-        return json.loads(body.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError) as e:
-        msg = "Case fetch JSON decode failed"
-        _case_fetch_log_error("json_error", msg)
-        raise CaseFetchError("json_error", msg) from e
-
-
-def _case_fetch_page_for_enqueue(
-    jwt: str, from_ts: int, skip: int = 0,
-) -> Tuple[dict, bool]:
-    """
-    Fetch one Cases API page for enqueue.
-
-    Returns (response_dict, summary_fallback_used).
-    When include_summary is enabled and the summary request times out or
-    returns HTTP 5xx, retries once with include_summary=false.
-    """
-    if not CASE_INCLUDE_SUMMARY:
-        return fetch_cases_page(jwt, from_ts, skip), False
-
-    try:
-        return fetch_cases_page(jwt, from_ts, skip), False
-    except CaseFetchError as e:
-        retry = e.kind == "timeout" or (
-            e.kind == "http_error"
-            and e.http_code is not None
-            and e.http_code >= 500
-        )
-        if not retry:
-            _case_fetch_log_error(e.kind, str(e), e.http_code)
-            raise RuntimeError(str(e)) from e
-
-        msg = (
-            f"Case fetch with summary failed ({e.kind}); "
-            f"retrying same page with include_summary=false"
-        )
-        print(f"[case] [stellar_api] {msg}", file=sys.stderr)
-        _case_fetch_log_error(e.kind, str(e), e.http_code)
-        log_operational_event(
-            "case", "stellar_api", "case_fetch_summary_fallback",
-            msg,
-            error=str(e), http_code=e.http_code,
-            skip=skip, from_modified_at_ms=from_ts,
-        )
-        debug_log(
-            "case", "summary fetch fallback",
-            skip=skip, error_kind=e.kind, http_code=e.http_code,
-        )
-
-        res = fetch_cases_page(jwt, from_ts, skip, include_summary=False)
-        data = res.get("data", {})
-        for case in data.get("cases", []):
-            if isinstance(case, dict):
-                case["summary_fetch_fallback"] = True
-                case["kill_chain_parse_source"] = "missing_summary"
-        return res, True
+        raise RuntimeError(f"Case fetch failed HTTP {code}: {body[:200]!r}")
+    return json.loads(body.decode("utf-8"))
 
 
 def _case_checkpoint_get(conn: sqlite3.Connection) -> Optional[str]:
@@ -2332,14 +2123,7 @@ def case_fetch_and_enqueue(conn: sqlite3.Connection) -> int:
 
     while pages < MAX_FETCH_PAGES_PER_CYCLE:
         check_shutdown()
-        res, summary_fallback = with_backoff(
-            lambda s=skip: _case_fetch_page_for_enqueue(jwt, from_ts, skip=s),
-        )
-        if summary_fallback:
-            debug_log(
-                "case", "fetch page used summary fallback",
-                page=pages + 1, skip=skip,
-            )
+        res = with_backoff(lambda s=skip: fetch_cases_page(jwt, from_ts, skip=s))
         data = res.get("data", {})
         cases = data.get("cases", [])
         if not cases:
@@ -2375,29 +2159,6 @@ def case_fetch_and_enqueue(conn: sqlite3.Connection) -> int:
                 (str(case_id), sort_ts, str(case_id), payload_text, now_inserted_at),
             )
             page_new += 1
-            if DEBUG:
-                summary = case.get("summary")
-                parsed, source = _case_resolve_kill_chain_fields(case)
-                debug_log(
-                    "case",
-                    "case fetch summary diagnostic",
-                    case_id=case_id,
-                    name=case.get("name"),
-                    score=case.get("score"),
-                    include_summary=CASE_INCLUDE_SUMMARY,
-                    format_summary=CASE_FORMAT_SUMMARY,
-                    summary_present=summary is not None,
-                    summary_type=type(summary).__name__ if summary is not None else "NoneType",
-                    summary_first_line=(
-                        summary.splitlines()[0]
-                        if isinstance(summary, str) and summary.splitlines()
-                        else None
-                    ),
-                    summary_keys=list(summary.keys()) if isinstance(summary, dict) else None,
-                    parsed_kill_chain_stages=parsed,
-                    kill_chain_parse_source=case.get("kill_chain_parse_source") or source,
-                    summary_fetch_fallback=case.get("summary_fetch_fallback"),
-                )
             debug_log(
                 "case", "enqueued (new)" if not backfill_mode() else "enqueued (backfill)",
                 case_id=case_id,
@@ -2476,39 +2237,6 @@ def case_drain_queue(conn: sqlite3.Connection) -> int:
                 obj = {"raw": payload_text}
 
             outbound = _case_syslog_payload(obj)
-
-            if DEBUG:
-                summary = obj.get("summary") if isinstance(obj, dict) else None
-                parsed, source = (
-                    _case_resolve_kill_chain_fields(obj)
-                    if isinstance(obj, dict)
-                    else (_case_kill_chain_stages_zero(), "non_dict_payload")
-                )
-                debug_log(
-                    "case",
-                    "kill chain parse diagnostic",
-                    event_id=event_id,
-                    name=obj.get("name") if isinstance(obj, dict) else None,
-                    score=obj.get("score") if isinstance(obj, dict) else None,
-                    summary_present=summary is not None,
-                    summary_type=type(summary).__name__ if summary is not None else "NoneType",
-                    summary_first_line=(
-                        summary.splitlines()[0]
-                        if isinstance(summary, str) and summary.splitlines()
-                        else None
-                    ),
-                    summary_keys=list(summary.keys()) if isinstance(summary, dict) else None,
-                    parsed_kill_chain_stages=parsed,
-                    kill_chain_parse_source=(
-                        obj.get("kill_chain_parse_source") or source
-                        if isinstance(obj, dict) else source
-                    ),
-                    outbound_kill_chain_fields=_case_kill_chain_outbound_fields(outbound),
-                    syslog_payload_kill_chain_fields=_case_kill_chain_outbound_fields(outbound),
-                    summary_fetch_fallback=(
-                        obj.get("summary_fetch_fallback") if isinstance(obj, dict) else None
-                    ),
-                )
 
             def _send_once(o=outbound):
                 nonlocal sock
@@ -2794,16 +2522,329 @@ def _handle_signal(signum, _frame):
 
 
 # ============================================================
+# Interactive setup / systemd installation
+# ============================================================
+
+SYSTEMD_SERVICE_NAME = "stellar-alert-case-syslog"
+SYSTEMD_INSTALL_DIR = "/usr/local/lib/stellar-alert-case"
+SYSTEMD_INSTALL_SCRIPT = os.path.join(SYSTEMD_INSTALL_DIR, "Stellar_Alert_Case_Syslog.py")
+SYSTEMD_ENV_PATH = f"/etc/default/{SYSTEMD_SERVICE_NAME}"
+SYSTEMD_UNIT_PATH = f"/etc/systemd/system/{SYSTEMD_SERVICE_NAME}.service"
+
+
+def _prompt_text(label: str, default: Optional[str] = None, required: bool = False) -> str:
+    while True:
+        suffix = f" [{default}]" if default not in (None, "") else ""
+        value = input(f"{label}{suffix}: ").strip()
+        if not value and default is not None:
+            value = str(default)
+        if value or not required:
+            return value
+        print("  A value is required.", file=sys.stderr)
+
+
+def _prompt_positive_int(
+    label: str,
+    default: int,
+    max_value: int = 65535,
+    min_value: int = 1,
+) -> int:
+    while True:
+        raw = _prompt_text(label, str(default), required=True)
+        try:
+            value = int(raw)
+        except ValueError:
+            print("  Enter a number.", file=sys.stderr)
+            continue
+        if min_value <= value <= max_value:
+            return value
+        print(f"  Enter a value between {min_value} and {max_value}.", file=sys.stderr)
+
+
+def _prompt_ip(label: str, default: Optional[str] = None) -> str:
+    while True:
+        value = _prompt_text(label, default, required=True)
+        try:
+            ipaddress.ip_address(value)
+            return value
+        except ValueError:
+            print("  Enter a valid IPv4 or IPv6 address.", file=sys.stderr)
+
+
+def _prompt_yes_no(label: str, default: bool = True) -> bool:
+    hint = "Y/n" if default else "y/N"
+    while True:
+        raw = input(f"{label} [{hint}]: ").strip().lower()
+        if not raw:
+            return default
+        if raw in ("y", "yes"):
+            return True
+        if raw in ("n", "no"):
+            return False
+        print("  Enter y or n.", file=sys.stderr)
+
+
+def _invoking_user() -> Tuple[str, str, str]:
+    """Return (user, group, home), preferring the pre-sudo user."""
+    user = os.environ.get("SUDO_USER") or getpass.getuser()
+    pw = pwd.getpwnam(user)
+    try:
+        import grp
+        group = grp.getgrgid(pw.pw_gid).gr_name
+    except Exception:
+        group = user
+    return user, group, pw.pw_dir
+
+
+def _systemd_quote(value: str) -> str:
+    return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
+def _env_quote(value: str) -> str:
+    if "\n" in value or "\r" in value:
+        raise ValueError("environment values may not contain newlines")
+    return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
+def _root_cmd(cmd: List[str], *, check: bool = True) -> subprocess.CompletedProcess:
+    if os.geteuid() == 0:
+        full = cmd
+    else:
+        full = ["sudo"] + cmd
+    return subprocess.run(full, check=check)
+
+
+def _write_root_file(path: str, content: str, mode: int) -> None:
+    """Write a temporary local file, then install it atomically as root."""
+    fd, tmp = tempfile.mkstemp(prefix="stellar-alert-case-", text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fp:
+            fp.write(content)
+        _root_cmd(["install", "-m", f"{mode:o}", tmp, path])
+    finally:
+        try:
+            os.remove(tmp)
+        except FileNotFoundError:
+            pass
+
+
+def _wizard_args_to_cli(args) -> List[str]:
+    cli = [
+        "--host", args.host,
+        "--userid", args.userid,
+    ]
+    if args.alert_interval is not None:
+        cli += [
+            "--alert-interval", str(args.alert_interval),
+            "--alert-syslog-ip", args.alert_syslog_ip,
+            "--alert-syslog-port", str(args.alert_syslog_port),
+        ]
+    if args.case_interval is not None:
+        cli += [
+            "--case-interval", str(args.case_interval),
+            "--case-syslog-ip", args.case_syslog_ip,
+            "--case-syslog-port", str(args.case_syslog_port),
+        ]
+    cli += ["--initial-lookback-hours", str(args.initial_lookback_hours)]
+    return cli
+
+
+def _print_wizard_summary(args) -> None:
+    print("\nConfiguration summary")
+    print("---------------------")
+    print(f"Stellar Cyber host : {args.host}")
+    print(f"User ID             : {args.userid}")
+    print(f"API token           : {'configured' if args.token else 'NOT configured'}")
+    if args.alert_interval is not None:
+        print(f"Alert               : every {args.alert_interval}s -> "
+              f"{args.alert_syslog_ip}:{args.alert_syslog_port}")
+    else:
+        print("Alert               : disabled")
+    if args.case_interval is not None:
+        print(f"Case                : every {args.case_interval}s -> "
+              f"{args.case_syslog_ip}:{args.case_syslog_port}")
+    else:
+        print("Case                : disabled")
+    print(f"Initial lookback     : {args.initial_lookback_hours} hour(s)")
+
+
+def install_systemd_service(args) -> bool:
+    """Install this script + config as a system service, enable it, start it, and show health/logs."""
+    if sys.platform != "linux":
+        print("ERROR: systemd installation is supported on Linux only.", file=sys.stderr)
+        return False
+    if not os.path.isdir("/run/systemd/system"):
+        print("ERROR: systemd does not appear to be running on this host.", file=sys.stderr)
+        return False
+
+    user, group, home = _invoking_user()
+    source_script = os.path.realpath(__file__)
+    cli = _wizard_args_to_cli(args)
+    exec_parts = ["/usr/bin/python3", SYSTEMD_INSTALL_SCRIPT] + cli
+    exec_start = " ".join(_systemd_quote(x) for x in exec_parts)
+
+    unit = f"""[Unit]
+Description=Stellar Cyber Alert + Case to Syslog
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User={user}
+Group={group}
+WorkingDirectory={home}
+Environment=HOME={home}
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-{SYSTEMD_ENV_PATH}
+ExecStart={exec_start}
+Restart=always
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
+"""
+    env_file = "STELLAR_TOKEN=" + _env_quote(args.token or "") + "\n"
+
+    print("\nInstalling systemd service...")
+    try:
+        if os.geteuid() != 0:
+            print("Administrator privileges are required; sudo may ask for your password.")
+            _root_cmd(["-v"])
+        _root_cmd(["install", "-d", "-m", "0755", SYSTEMD_INSTALL_DIR])
+        _root_cmd(["install", "-m", "0755", source_script, SYSTEMD_INSTALL_SCRIPT])
+        _write_root_file(SYSTEMD_ENV_PATH, env_file, 0o600)
+        _write_root_file(SYSTEMD_UNIT_PATH, unit, 0o644)
+        _root_cmd(["systemctl", "daemon-reload"])
+        _root_cmd(["systemctl", "enable", SYSTEMD_SERVICE_NAME])
+        _root_cmd(["systemctl", "restart", SYSTEMD_SERVICE_NAME])
+    except (OSError, subprocess.CalledProcessError, ValueError) as exc:
+        print(f"ERROR: systemd installation failed: {exc}", file=sys.stderr)
+        return False
+
+    time.sleep(2)
+    print("\nService status")
+    print("--------------")
+    _root_cmd(["systemctl", "--no-pager", "--full", "status", SYSTEMD_SERVICE_NAME], check=False)
+    print("\nRecent journal logs")
+    print("-------------------")
+    _root_cmd(["journalctl", "-u", SYSTEMD_SERVICE_NAME, "-n", "20", "--no-pager"], check=False)
+
+    active = _root_cmd(["systemctl", "is-active", "--quiet", SYSTEMD_SERVICE_NAME], check=False)
+    enabled = _root_cmd(["systemctl", "is-enabled", "--quiet", SYSTEMD_SERVICE_NAME], check=False)
+    if active.returncode == 0 and enabled.returncode == 0:
+        print(f"\nOK: {SYSTEMD_SERVICE_NAME}.service is active and enabled.")
+        print("Review the recent journal above to confirm API fetch and syslog delivery.")
+        print(f"Follow logs: sudo journalctl -u {SYSTEMD_SERVICE_NAME} -f")
+        print(f"Status     : sudo systemctl status {SYSTEMD_SERVICE_NAME}")
+        return True
+
+    state = []
+    if active.returncode != 0:
+        state.append("not active")
+    if enabled.returncode != 0:
+        state.append("not enabled")
+    print(
+        f"\nWARNING: {SYSTEMD_SERVICE_NAME}.service is {' and '.join(state)}. "
+        "Review the journal above.",
+        file=sys.stderr,
+    )
+    return False
+
+
+def run_setup_wizard():
+    """Interactive configuration wizard. Returns args for foreground mode, or None when handled."""
+    print("Stellar Cyber Alert + Case -> Syslog setup wizard")
+    print("================================================")
+    print("Press Enter to accept values shown in [brackets].\n")
+
+    host = _prompt_text("Stellar Cyber host", HOST, required=True)
+    userid = _prompt_text("User ID", USERID, required=True)
+    if ALL_ACCESS_TOKEN:
+        token = getpass.getpass("All-Access API token [Enter = use current configured token]: ").strip()
+        if not token:
+            token = ALL_ACCESS_TOKEN
+    else:
+        token = getpass.getpass("All-Access API token: ").strip()
+        while not token:
+            print("  API token is required.", file=sys.stderr)
+            token = getpass.getpass("All-Access API token: ").strip()
+
+    while True:
+        enable_alert = _prompt_yes_no("Enable Alert forwarding?", True)
+        enable_case = _prompt_yes_no("Enable Case forwarding?", False)
+        if enable_alert or enable_case:
+            break
+        print("At least one of Alert or Case must be enabled.\n", file=sys.stderr)
+
+    argv: List[str] = ["--host", host, "--userid", userid, "--token", token]
+    alert_ip: Optional[str] = None
+    if enable_alert:
+        alert_interval = _prompt_positive_int("Alert interval (seconds)", 60, max_value=86400)
+        alert_ip = _prompt_ip("Alert syslog IP")
+        alert_port = _prompt_positive_int("Alert syslog port", 5201)
+        argv += [
+            "--alert-interval", str(alert_interval),
+            "--alert-syslog-ip", alert_ip,
+            "--alert-syslog-port", str(alert_port),
+        ]
+
+    if enable_case:
+        case_interval = _prompt_positive_int("Case interval (seconds)", 300, max_value=86400)
+        case_ip = _prompt_ip("Case syslog IP", alert_ip)
+        case_port = _prompt_positive_int("Case syslog port", 5202)
+        argv += [
+            "--case-interval", str(case_interval),
+            "--case-syslog-ip", case_ip,
+            "--case-syslog-port", str(case_port),
+        ]
+
+    lookback = _prompt_positive_int("Initial lookback (hours)", INITIAL_LOOKBACK_HOURS, max_value=24 * 365, min_value=0)
+    argv += ["--initial-lookback-hours", str(lookback)]
+    args = parse_args(argv)
+    _print_wizard_summary(args)
+
+    if not _prompt_yes_no("Use this configuration?", True):
+        print("Setup cancelled.")
+        return None
+
+    if _prompt_yes_no("Run continuously with systemd (auto-start on boot)?", True):
+        if not install_systemd_service(args):
+            return False
+        return None
+
+    manual = [sys.executable, os.path.realpath(__file__)] + _wizard_args_to_cli(args)
+    print("\nSystemd was not installed.")
+    print("Equivalent manual command:")
+    print("  " + " ".join(shlex.quote(x) for x in manual))
+    if _prompt_yes_no("Run now in the foreground?", True):
+        return args
+    return None
+
+
+# ============================================================
 # CLI
 # ============================================================
 
-def parse_args():
+class SafeDefaultsHelpFormatter(argparse.ArgumentDefaultsHelpFormatter,
+                                argparse.RawDescriptionHelpFormatter):
+    """Keep useful defaults in --help, but never print the API-token default."""
+    def _get_help_string(self, action):
+        if action.dest == "token":
+            return action.help
+        return super()._get_help_string(action)
+
+
+def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description="Stellar Cyber Alert + Case syslog daemon",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=SafeDefaultsHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  # alert only\n"
+            "  # interactive setup wizard\n"
+            "  python3 %(prog)s\n"
+            "  python3 %(prog)s --setup\n"
+            "  # alert only (manual/foreground)\n"
             "  python3 %(prog)s --alert-interval 60 --alert-syslog-ip 10.0.0.1 --alert-syslog-port 5142\n"
             "  # case only\n"
             "  python3 %(prog)s --case-interval 300 --case-syslog-ip 10.0.0.1 --case-syslog-port 5143\n"
@@ -2813,9 +2854,12 @@ def parse_args():
         ),
     )
 
+    p.add_argument("--setup", action="store_true",
+                   help="Run the interactive configuration/systemd setup wizard")
     p.add_argument("--host", default=HOST)
     p.add_argument("--userid", default=USERID)
-    p.add_argument("--token", default=ALL_ACCESS_TOKEN, help="All-Access API token")
+    p.add_argument("--token", default=os.environ.get("STELLAR_TOKEN", ALL_ACCESS_TOKEN),
+                   help="All-Access API token (or STELLAR_TOKEN environment variable)")
 
     alert = p.add_argument_group("alert (all three required to enable alert fetch/send)")
     alert.add_argument("--alert-interval", type=int, default=None, metavar="SEC",
@@ -2850,28 +2894,11 @@ def parse_args():
                         "re-sends data in the window)")
 
     p.add_argument("--case-min-score", type=int, default=CASE_MIN_SCORE)
-    p.add_argument(
-        "--case-include-summary",
-        action=argparse.BooleanOptionalAction,
-        default=CASE_INCLUDE_SUMMARY,
-        help="Request case summary from the API (required for Kill Chain parsing; default: on). "
-             "Use --no-case-include-summary to fetch base fields only (Kill Chain may be all-zero).",
-    )
-    p.add_argument(
-        "--case-format-summary",
-        action=argparse.BooleanOptionalAction,
-        default=CASE_FORMAT_SUMMARY,
-        help="Request formatted string summary (slower; higher timeout risk). "
-             "Default: off (--no-case-format-summary); structured dict summary is used.",
-    )
+    p.add_argument("--case-include-summary",
+                   action=argparse.BooleanOptionalAction, default=CASE_INCLUDE_SUMMARY)
+    p.add_argument("--case-format-summary",
+                   action=argparse.BooleanOptionalAction, default=CASE_FORMAT_SUMMARY)
     p.add_argument("--case-fetch-limit", type=int, default=CASE_FETCH_LIMIT)
-    p.add_argument(
-        "--case-fetch-timeout",
-        type=int,
-        default=CASE_FETCH_TIMEOUT_SEC,
-        metavar="SEC",
-        help="Case API fetch timeout in seconds (default: 90).",
-    )
 
     p.add_argument("--db-path", default=DB_PATH)
     p.add_argument("--log-dir", default=LOG_DIR)
@@ -2882,7 +2909,7 @@ def parse_args():
                    help="Print alert/case fetch/enqueue/send summary logs to stderr "
                         "(HTTP/HTTP payload noise excluded)")
 
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 def apply_config(args) -> None:
@@ -2891,7 +2918,6 @@ def apply_config(args) -> None:
     global ALERT_SYSLOG_IP, ALERT_SYSLOG_PORT, CASE_SYSLOG_IP, CASE_SYSLOG_PORT
     global ALERT_ENABLED, CASE_ENABLED
     global CASE_MIN_SCORE, CASE_INCLUDE_SUMMARY, CASE_FORMAT_SUMMARY, CASE_FETCH_LIMIT
-    global CASE_FETCH_TIMEOUT_SEC
     global DB_PATH, LOG_DIR, LOCK_PATH, DEBUG, SEND_LOG_RETENTION_DAYS
     global ALERT_SENT_RETENTION_MINUTES, ALERT_FETCH_STABILITY_LAG_SEC
 
@@ -2923,7 +2949,6 @@ def apply_config(args) -> None:
     CASE_INCLUDE_SUMMARY = args.case_include_summary
     CASE_FORMAT_SUMMARY = args.case_format_summary
     CASE_FETCH_LIMIT = args.case_fetch_limit
-    CASE_FETCH_TIMEOUT_SEC = args.case_fetch_timeout
 
     DB_PATH = os.path.expanduser(args.db_path)
     LOG_DIR = os.path.expanduser(args.log_dir)
@@ -2938,6 +2963,13 @@ def apply_config(args) -> None:
 
 def main() -> int:
     args = parse_args()
+    if len(sys.argv) == 1 or args.setup:
+        args = run_setup_wizard()
+        if args is False:
+            return 1
+        if args is None:
+            return 0
+
     apply_config(args)
 
     stream_err = validate_stream_cli(args)
@@ -2953,6 +2985,10 @@ def main() -> int:
         print("ERROR: --backfill must be a positive integer (days).", file=sys.stderr)
         return 1
 
+    if INITIAL_LOOKBACK_HOURS < 0:
+        print("ERROR: --initial-lookback-hours must be 0 or a positive integer.", file=sys.stderr)
+        return 1
+
     if SEND_LOG_RETENTION_DAYS < 1:
         print("ERROR: --send-log-retention-days must be a positive integer.", file=sys.stderr)
         return 1
@@ -2963,10 +2999,6 @@ def main() -> int:
 
     if ALERT_FETCH_STABILITY_LAG_SEC < 1:
         print("ERROR: --alert-fetch-stability-lag-sec must be a positive integer.", file=sys.stderr)
-        return 1
-
-    if CASE_FETCH_TIMEOUT_SEC < 1:
-        print("ERROR: --case-fetch-timeout must be a positive integer.", file=sys.stderr)
         return 1
 
     lock_f = acquire_lock()
