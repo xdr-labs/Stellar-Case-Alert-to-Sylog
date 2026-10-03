@@ -10,8 +10,8 @@ project:
   name: xdr-labs__Stellar-Case-Alert-to-Sylog
   type: python-service
   maturity: development
-  user_facing: false
-  primary_user_surface: none
+  user_facing: true
+  primary_user_surface: cli
 domains:
 - core
 platforms:
