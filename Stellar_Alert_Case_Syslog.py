@@ -56,7 +56,7 @@ CASE_SYSLOG_PORT = None
 ALERT_ENABLED = False
 CASE_ENABLED = False
 
-INITIAL_LOOKBACK_HOURS = 48
+INITIAL_LOOKBACK_HOURS = 1
 INITIAL_LOOKBACK_ZERO_MINUTES = 1  # when --initial-lookback-hours 0
 BACKFILL_DAYS = None  # set by --backfill (test mode)
 
