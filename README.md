@@ -86,7 +86,7 @@ The API token is entered without echo and is not embedded in the systemd `ExecSt
 | Case forwarding | disabled |
 | Case interval | 300 seconds |
 | Case destination port | 5202 |
-| Initial lookback | 48 hours |
+| Initial lookback | 1 hour |
 
 `--initial-lookback-hours 0` means the last 1 minute.
 

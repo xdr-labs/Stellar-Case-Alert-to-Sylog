@@ -63,7 +63,7 @@ API Token은 화면에 표시되지 않으며 systemd `ExecStart`에도 포함�
 | Case | 비활성화 |
 | Case Interval | 300초 |
 | Case Port | 5202 |
-| Initial Lookback | 48시간 |
+| Initial Lookback | 1시간 |
 
 `--initial-lookback-hours 0`은 최근 1분을 의미합니다.
 

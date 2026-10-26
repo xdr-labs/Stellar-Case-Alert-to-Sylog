@@ -22,7 +22,7 @@ scenarios:
   - affected
   platforms:
   - linux
-  command: python3 -m py_compile Stellar_Alert_Case_Syslog.py
+  command: bash -lc 'python3 -m py_compile Stellar_Alert_Case_Syslog.py && python3 -m unittest discover -s tests -v'
   invariants:
   - project-native tests remain green for affected changes
   release_gate: true
